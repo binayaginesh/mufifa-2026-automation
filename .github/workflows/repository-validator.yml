@@ -1,0 +1,97 @@
+name: Repository Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate-pr:
+    name: Validate Repository Rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR Structure
+        run: |
+
+          echo "========================================"
+          echo "Repository Validation Started"
+          echo "========================================"
+
+          CHANGED=$(git diff --name-status \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }})
+
+          echo ""
+          echo "Changed Files:"
+          echo "$CHANGED"
+          echo ""
+
+          COUNT=$(echo "$CHANGED" | grep -c .)
+
+          #########################################
+          # Rule 1 : Exactly one file
+          #########################################
+
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Exactly ONE file must be changed."
+            exit 1
+          fi
+
+          STATUS=$(echo "$CHANGED" | awk '{print $1}')
+          FILE=$(echo "$CHANGED" | awk '{print $2}')
+
+          echo "File Status : $STATUS"
+          echo "File Path   : $FILE"
+
+          #########################################
+          # Rule 2 : File must be Added
+          #########################################
+
+          if [ "$STATUS" != "A" ]; then
+            echo "::error::Only NEW profile files can be submitted."
+            exit 1
+          fi
+
+          #########################################
+          # Rule 3 : Must be inside profile/
+          #########################################
+
+          if [[ "$FILE" != profile/* ]]; then
+            echo "::error::Profile must be inside the profile/ directory."
+            exit 1
+          fi
+
+          #########################################
+          # Rule 4 : Markdown file
+          #########################################
+
+          if [[ "$FILE" != *.md ]]; then
+            echo "::error::Profile must be a Markdown (.md) file."
+            exit 1
+          fi
+
+          #########################################
+          # Rule 5 : Filename format
+          #########################################
+
+          FILENAME=$(basename "$FILE")
+
+          if [[ ! "$FILENAME" =~ ^[A-Za-z0-9._-]+@mulearn\.md$ ]]; then
+            echo "::error::Filename must follow <muid>@mulearn.md"
+            exit 1
+          fi
+
+          #########################################
+          # Success
+          #########################################
+
+          echo ""
+          echo "========================================"
+          echo "Repository Validation Passed"
+          echo "========================================"

@@ -59,53 +59,247 @@ def check_filename(path):
     return True, f"Filename is valid: {name}"
 
 
+def clean_heading_text(text):
+    """
+    Remove markdown heading symbols, bold/italic markup, colons, emojis,
+    normalize mu/micro signs, and normalize spaces for robust comparison.
+    """
+    text = text.lower()
+    text = text.replace("µ", "u").replace("μ", "u")
+    # Replace dashes and hyphens with a space
+    text = re.sub(r'[\-\u2013\u2014\u2212]', ' ', text)
+    # Remove markdown formatting and colons
+    text = re.sub(r'[#\*_\:]', '', text)
+    # Keep alphanumeric characters, spaces, and ampersand/vertical bar/slash
+    text = re.sub(r'[^a-z0-9\s\&\|\/]', '', text)
+    return " ".join(text.split())
+
+
+def is_horizontal_rule(line, prev_line_was_blank):
+    """
+    Check if a line is a horizontal rule. Supports Setext heading context.
+    """
+    line_strip = line.strip()
+    if re.match(r'^\*{3,}\s*$', line_strip):
+        return True
+    if re.match(r'^[-_]{3,}\s*$', line_strip):
+        if line_strip.startswith("_"):
+            return True
+        return prev_line_was_blank
+    return False
+
+
+def get_heading_level(line):
+    line_strip = line.strip()
+    m = re.match(r'^(#+)\s+', line_strip)
+    if m:
+        return len(m.group(1))
+    return 99
+
+
+def is_line_heading(line, clean_target):
+    """
+    Checks if a line is formatted as a heading and matches clean_target.
+    """
+    line_strip = line.strip()
+    if not line_strip:
+        return False
+    if line_strip.startswith("- ") or (line_strip.startswith("* ") and not line_strip.startswith("**")):
+        return False
+    cleaned_line = clean_heading_text(line_strip)
+    if cleaned_line != clean_target:
+        return False
+    if re.match(r'^#+\s+', line_strip):
+        return True
+    if line_strip.startswith("**") and line_strip.rstrip(":").endswith("**"):
+        return True
+    if len(line_strip) < 100:
+        return True
+    return False
+
+
+def heading_exists(content, heading_name):
+    """
+    Returns True if heading_name exists as a heading in content.
+    """
+    clean_target = clean_heading_text(heading_name)
+    for line in content.splitlines():
+        if is_line_heading(line, clean_target):
+            return True
+    return False
+
+
+def find_heading_line(content, heading_name):
+    """
+    Finds the actual matched heading line in the file content, returning it for messages.
+    """
+    clean_target = clean_heading_text(heading_name)
+    for line in content.splitlines():
+        if is_line_heading(line, clean_target):
+            return line.strip()
+    return heading_name
+
+
+def extract_section(content, heading_name):
+    """
+    Extracts the content of a section.
+    Returns the body text of the section if found, otherwise None.
+    """
+    lines = content.splitlines()
+    clean_target = clean_heading_text(heading_name)
+    
+    start_idx = -1
+    start_level = 99
+    for idx, line in enumerate(lines):
+        if is_line_heading(line, clean_target):
+            start_idx = idx
+            start_level = get_heading_level(line)
+            break
+            
+    if start_idx == -1:
+        return None
+        
+    all_headings = {clean_heading_text(h) for h in REQUIRED_SECTIONS + REQUIRED_TOP_SECTIONS + ["About Me"]}
+    all_headings.discard(clean_target)
+    
+    section_lines = []
+    prev_line_was_blank = False
+    
+    for idx in range(start_idx + 1, len(lines)):
+        line = lines[idx]
+        line_strip = line.strip()
+        
+        # 1. Horizontal rule terminates the section
+        if is_horizontal_rule(line, prev_line_was_blank):
+            break
+            
+        # 2. Matches another required heading
+        cleaned_line = clean_heading_text(line_strip)
+        if cleaned_line in all_headings and is_line_heading(line, cleaned_line):
+            break
+            
+        # 3. Heading level is equal or higher
+        if line_strip.startswith("#"):
+            level = get_heading_level(line)
+            if start_level != 99:
+                if level <= start_level:
+                    break
+            else:
+                if level <= 2:
+                    break
+                    
+        # Skip Setext style headings underlines if they immediately follow the start heading
+        if idx == start_idx + 1 and re.match(r'^[-=]{3,}\s*$', line_strip):
+            prev_line_was_blank = (line_strip == "")
+            continue
+            
+        section_lines.append(line)
+        prev_line_was_blank = (line_strip == "")
+        
+    return "\n".join(section_lines).strip()
+
+
 def check_header(lines):
-    """First line must be # Name (...), second ### line must contain 'FIFA Nation:'"""
-    if not lines:
+    """
+    Validate the profile header.
+    - Ignores blank lines.
+    - Ignores UTF-8 BOM.
+    - Title exists.
+    - Squad Domain and FIFA Nation exist in the first few lines.
+    - Validates Squad Domain value.
+    """
+    cleaned = []
+    for line in lines:
+        line = line.replace("\ufeff", "").strip()
+        if line:
+            cleaned.append(line)
+
+    if not cleaned:
         return False, "File is empty"
-    if not lines[0].startswith("# "):
-        return False, f"First line must start with '# Full Name ...' - got: {lines[0][:60]!r}"
-    
-    header_line = next((l for l in lines[:5] if l.startswith("### ") and "FIFA Nation:" in l), None)
-    if not header_line:
-        return False, "Missing '### Squad Domain: ... | FIFA Nation: ...' line in the first 5 lines"
-    
-    squad_domain_keywords = ["Coder", "Maker", "Designer", "Strategist"]
-    if not any(g in header_line for g in squad_domain_keywords):
-        return False, f"Squad Domain line must include at least one of: {', '.join(squad_domain_keywords)}"
-    
-    return True, "Header and Squad Domain/Nation line found"
+
+    # Check that a title exists (first non-blank line)
+    title_line = cleaned[0]
+    if "squad domain" in title_line.lower() or "fifa nation" in title_line.lower():
+        return False, f"Missing title. Found: {title_line!r}"
+
+    squad_domain_line = None
+    fifa_nation_line = None
+
+    for line in cleaned[:10]:
+        if "squad domain" in line.lower():
+            squad_domain_line = line
+        if "fifa nation" in line.lower():
+            fifa_nation_line = line
+
+    if not squad_domain_line:
+        return False, "Missing Squad Domain"
+    if not fifa_nation_line:
+        return False, "Missing FIFA Nation"
+
+    valid_domains = [
+        "Coder",
+        "Maker",
+        "Designer",
+        "Strategist"
+    ]
+
+    squad_domain_lower = squad_domain_line.lower()
+    if not any(domain.lower() in squad_domain_lower for domain in valid_domains):
+        return False, "Invalid Squad Domain"
+
+    return True, "Header looks good"
 
 
 def check_about_me(content):
-    """About Me blockquote must exist and be at least 200 characters"""
-    # Capture all consecutive > lines after ### About Me
-    about_match = re.search(r'### About Me\s*\n+((?:>.*\n?)+)', content)
-    if not about_match:
-        return False, "'### About Me' section with a blockquote (>) is missing"
-    
-    # Strip leading > from each line and join
-    raw_block = about_match.group(1)
-    quote_text = re.sub(r'^>\s?', '', raw_block, flags=re.MULTILINE).strip()
-    
-    if len(quote_text) < 200:
-        return False, f"About Me must be at least 200 characters - currently {len(quote_text)} characters"
-    
-    return True, f"About Me is {len(quote_text)} characters ✓"
+    """
+    About Me section must exist and contain at least 200 characters.
+    """
+    about_text = extract_section(content, "About Me")
+    if about_text is None:
+        return False, "'### About Me' section is missing"
+
+    placeholder_patterns = [
+        r'^\s*-\s*$',
+        r'^\s*-\s*\.\.\.\s*$',
+        r'^\s*-\s*N/A\s*$',
+        r'^\s*-\s*TBD\s*$',
+        r'^\s*-\s*write about your self',
+        r'^\s*-\s*write about yourself',
+        r'^\s*>\s*Who are you',
+    ]
+
+    about_lines = []
+    for line in about_text.splitlines():
+        line = line.strip()
+        # Remove blockquote markers if present
+        line = re.sub(r'^>\s*', '', line).strip()
+        if not line:
+            continue
+        # Filter placeholders
+        if any(re.match(p, line, re.IGNORECASE) for p in placeholder_patterns):
+            continue
+        # Filter comments and templates
+        if line.startswith("<!--") or line.startswith("*If you're just starting") or line.startswith("- *If you're just starting"):
+            continue
+        about_lines.append(line)
+
+    meaningful_text = "\n".join(about_lines).strip()
+    char_count = len(meaningful_text)
+
+    if char_count < 200:
+        return False, (
+            f"About Me must be at least 200 characters "
+            f"- currently {char_count} characters"
+        )
+
+    return True, f"About Me is {char_count} characters ✓"
 
 
 def check_top_sections(content):
-    """Top-level ## section headings (FIFA World Cup Corner, Portfolio Highlights) must be present"""
+    """Top-level section headings must be present"""
     errors = []
     for section in REQUIRED_TOP_SECTIONS:
-        # Match flexibly: allow optional emoji or extra characters between ## and the heading text
-        # e.g. "## ⚽ FIFA World Cup Corner" and "## FIFA World Cup Corner" both match
-        heading_text = re.escape(section.lstrip('## ').strip())
-        pattern = re.compile(
-            r'^##\s+.*?' + heading_text,
-            re.MULTILINE
-        )
-        if not pattern.search(content):
+        if not heading_exists(content, section):
             errors.append(f"Missing top-level section: {section}")
     if errors:
         return False, errors
@@ -113,15 +307,30 @@ def check_top_sections(content):
 
 
 def check_sections(content):
-    """All required #### sections must be present"""
+    """All required sections must be present"""
     errors = []
     for section in REQUIRED_SECTIONS:
-        if section not in content:
+        if not heading_exists(content, section):
             errors.append(f"Missing section: {section}")
-    
     if errors:
         return False, errors
     return True, "All required sections present"
+
+
+def check_domain_profiles(content):
+    """
+    Validate that Domain Profiles section contains at least one valid URL.
+    """
+    body = extract_section(content, "Domain Profiles")
+    if body is None:
+        return False, "Domain Profiles section is missing."
+    
+    # Match any valid http/https or www link
+    urls = re.findall(r'(?:https?://|www\.)[^\s\)\`\]\>]+', body)
+    if not urls:
+        return False, "At least one public profile or portfolio link is required in the Domain Profiles section."
+    
+    return True, "Domain Profiles looks good"
 
 
 def check_sections_not_empty(content, lines):
@@ -138,18 +347,15 @@ def check_sections_not_empty(content, lines):
         r'^\s*>\s*Who are you',                 # un-edited About Me prompt
     ]
 
-    section_pattern = re.compile(r'^(#{1,4} .+)$', re.MULTILINE)
-    section_positions = [(m.start(), m.group(1)) for m in section_pattern.finditer(content)]
-
-    for i, (pos, heading) in enumerate(section_positions):
-        if heading not in REQUIRED_SECTIONS:
+    for section in REQUIRED_SECTIONS:
+        body = extract_section(content, section)
+        if body is None:
             continue
-        # Content between this heading and the next
-        end = section_positions[i + 1][0] if i + 1 < len(section_positions) else len(content)
-        body = content[pos + len(heading):end].strip()
-
+            
+        actual_heading = find_heading_line(content, section)
+        
         if not body:
-            warnings.append(f"Section appears empty: {heading}")
+            warnings.append(f"Section appears empty: {actual_heading}")
             continue
 
         # Check if body is only placeholder lines
@@ -162,7 +368,7 @@ def check_sections_not_empty(content, lines):
         ]
 
         if not non_placeholder:
-            warnings.append(f"Section looks unfilled (only placeholder text): {heading}")
+            warnings.append(f"Section looks unfilled (only placeholder text): {actual_heading}")
 
     if warnings:
         return "warn", warnings
@@ -219,6 +425,7 @@ def validate(path):
         ("About Me length",      lambda: check_about_me(content)),
         ("Top-level sections",   lambda: check_top_sections(content)),
         ("Required sections",    lambda: check_sections(content)),
+        ("Domain Profiles",      lambda: check_domain_profiles(content)),
         ("Section content",      lambda: check_sections_not_empty(content, lines)),
         ("Profile Card",         lambda: check_profile_card(content)),
         ("MUID consistency",     lambda: check_mulearn_id_consistency(path, content)),
